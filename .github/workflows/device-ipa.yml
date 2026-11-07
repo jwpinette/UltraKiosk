@@ -27,16 +27,18 @@ jobs:
           else
             echo "No EDEN_PPN_B64 secret: building with the built-in 'Alexa' wake word"
           fi
-      - name: Settings hot-spot - invisible and in the TOP-LEFT corner (triple-tap there)
+      - name: Settings hot-spot - invisible, smaller, BOTTOM-RIGHT corner (triple-tap there)
         run: |
-          # The settings hot-spot is a gray 50x50 square at opacity 0.1 (ContentView.swift). 0.001 keeps it
-          # hit-testable (the same value the app uses for its other invisible tap area) but you can't see it.
-          perl -0pi -e 's/(\.fill\(Color\.gray\)\s*\.cornerRadius\(25\)\s*)\.opacity\(0\.1\)/${1}.opacity(0.001)/' UltraKiosk/ContentView.swift
-          # Move it from top-right (it sat on HA's Assist button and ate taps) to top-left (the hidden hamburger's
-          # empty spot): in the hot-spot's HStack, the Spacer() goes AFTER the Rectangle instead of before it.
-          perl -0pi -e 's/(\/\/ Settings Access[^\n]*\n\s*VStack \{\s*HStack \{)\s*Spacer\(\)\s*(Rectangle\(\).*?\})(\s*\})/$1\n                    $2\n                    Spacer()$3/s' UltraKiosk/ContentView.swift
-          sed -n '/Settings Access/,/Spacer()/p' UltraKiosk/ContentView.swift | head -14
-          grep -q 'opacity(0.001)' UltraKiosk/ContentView.swift || { echo "dot patch failed"; exit 1; }
+          F=UltraKiosk/ContentView.swift
+          # 1. invisible but still tappable: the gray square's opacity 0.1 -> 0.001 (same trick the app uses elsewhere)
+          perl -0pi -e 's/(\.fill\(Color\.gray\)\s*\.cornerRadius\(25\)\s*)\.opacity\(0\.1\)/${1}.opacity(0.001)/' $F
+          # 2. smaller: 50x50 -> 30x30 so it doesn't cover anything (JP 11-07)
+          perl -0pi -e 's/(\.opacity\(0\.001\)\s*)\.frame\(width: 50, height: 50\)/${1}.frame(width: 30, height: 30)/' $F
+          # 3. bottom-right: top-right sat on HA's Assist button, top-left on the Home tab. Move the VStack's trailing
+          #    Spacer() to BEFORE the HStack (HStack keeps Spacer-then-Rectangle = right side).
+          perl -0pi -e 's/(\/\/ Settings Access[^\n]*\n\s*VStack \{)(\s*HStack \{.*?onTapGesture\(count: 3\).*?\}\s*\})\s*Spacer\(\)/$1\n                Spacer()$2/s' $F
+          sed -n '/Settings Access/,/^            }/p' $F | head -16
+          grep -q 'opacity(0.001)' $F && grep -q 'width: 30, height: 30' $F || { echo "hot-spot patch failed - upstream changed"; exit 1; }
       - name: Build for device (no signing)
         run: |
           xcodebuild build \
@@ -55,6 +57,4 @@ jobs:
           ls -la UltraKiosk-unsigned.ipa
       - uses: actions/upload-artifact@v7
         with:
-          name: UltraKiosk-unsigned-ipa
-          path: UltraKiosk-unsigned.ipa
-          retention-days: 7
+          name: UltraKiosk-
