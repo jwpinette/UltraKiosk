@@ -27,12 +27,16 @@ jobs:
           else
             echo "No EDEN_PPN_B64 secret: building with the built-in 'Alexa' wake word"
           fi
-      - name: Make the settings dot invisible (still tappable - triple-tap the top-right corner)
+      - name: Settings hot-spot - invisible and in the TOP-LEFT corner (triple-tap there)
         run: |
           # The settings hot-spot is a gray 50x50 square at opacity 0.1 (ContentView.swift). 0.001 keeps it
           # hit-testable (the same value the app uses for its other invisible tap area) but you can't see it.
           perl -0pi -e 's/(\.fill\(Color\.gray\)\s*\.cornerRadius\(25\)\s*)\.opacity\(0\.1\)/${1}.opacity(0.001)/' UltraKiosk/ContentView.swift
-          grep -n 'opacity(0.001)' UltraKiosk/ContentView.swift | head -3
+          # Move it from top-right (it sat on HA's Assist button and ate taps) to top-left (the hidden hamburger's
+          # empty spot): in the hot-spot's HStack, the Spacer() goes AFTER the Rectangle instead of before it.
+          perl -0pi -e 's/(\/\/ Settings Access[^\n]*\n\s*VStack \{\s*HStack \{)\s*Spacer\(\)\s*(Rectangle\(\).*?\})(\s*\})/$1\n                    $2\n                    Spacer()$3/s' UltraKiosk/ContentView.swift
+          sed -n '/Settings Access/,/Spacer()/p' UltraKiosk/ContentView.swift | head -14
+          grep -q 'opacity(0.001)' UltraKiosk/ContentView.swift || { echo "dot patch failed"; exit 1; }
       - name: Build for device (no signing)
         run: |
           xcodebuild build \
