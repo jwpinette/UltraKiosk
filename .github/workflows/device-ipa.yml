@@ -1,0 +1,50 @@
+# UltraKiosk -> unsigned .ipa for a real iPad, with JP's own "Eden" wake word (2026-11-06).
+# Goes in JP's fork at .github/workflows/device-ipa.yml. Run it from the Actions tab ("Run workflow").
+# The upstream repo only builds for the simulator (can't be installed on a device) and hard-codes the
+# built-in "Alexa" wake word. This workflow:
+#   1. swaps the wake word for a custom Porcupine .ppn IF the secret EDEN_PPN_B64 is set (else keeps Alexa),
+#   2. builds for iphoneos without signing, 3. injects eden.ppn into the app bundle,
+#   4. zips Payload/ into UltraKiosk-unsigned.ipa and uploads it as a downloadable artifact.
+# Signing happens on JP's Windows PC with Sideloadly (his Apple ID), which re-signs the whole bundle.
+# The .ppn is account-bound, so it lives in a repo SECRET, never in the (public) repo.
+name: Device IPA (unsigned, custom wake word)
+on:
+  workflow_dispatch:
+jobs:
+  ipa:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode
+        run: sudo xcode-select -switch /Applications/Xcode_16.4.app
+      - name: Use the custom wake word (if EDEN_PPN_B64 is set)
+        env:
+          EDEN_PPN_B64: ${{ secrets.EDEN_PPN_B64 }}
+        run: |
+          if [ -n "$EDEN_PPN_B64" ]; then
+            perl -0pi -e 's/keywords:\s*\[Porcupine\.BuiltInKeyword\.alexa\],?/keywordPaths: [Bundle.main.path(forResource: "eden", ofType: "ppn") ?? ""],/' UltraKiosk/Managers/AudioManager.swift
+            grep -n 'keywordPaths' UltraKiosk/Managers/AudioManager.swift || { echo "patch did not apply - upstream code changed"; exit 1; }
+          else
+            echo "No EDEN_PPN_B64 secret: building with the built-in 'Alexa' wake word"
+          fi
+      - name: Build for device (no signing)
+        run: |
+          xcodebuild build \
+            -project UltraKiosk.xcodeproj -scheme UltraKiosk \
+            -sdk iphoneos -configuration Release -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            SWIFT_TREAT_WARNINGS_AS_ERRORS=NO OTHER_SWIFT_FLAGS="-D ED_SKIP_SWIFT_FORMAT"
+      - name: Package .ipa (+ eden.ppn)
+        env:
+          EDEN_PPN_B64: ${{ secrets.EDEN_PPN_B64 }}
+        run: |
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
+          [ -n "$EDEN_PPN_B64" ] && echo "$EDEN_PPN_B64" | base64 -D > "$APP/eden.ppn"
+          mkdir -p Payload && cp -R "$APP" Payload/
+          zip -qr UltraKiosk-unsigned.ipa Payload
+          ls -la UltraKiosk-unsigned.ipa
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UltraKiosk-unsigned-ipa
+          path: UltraKiosk-unsigned.ipa
+          retention-days: 7
