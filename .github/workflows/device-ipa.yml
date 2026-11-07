@@ -14,7 +14,7 @@ jobs:
   ipa:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Select Xcode
         run: sudo xcode-select -switch /Applications/Xcode_16.4.app
       - name: Use the custom wake word (if EDEN_PPN_B64 is set)
@@ -27,6 +27,12 @@ jobs:
           else
             echo "No EDEN_PPN_B64 secret: building with the built-in 'Alexa' wake word"
           fi
+      - name: Make the settings dot invisible (still tappable - triple-tap the top-right corner)
+        run: |
+          # The settings hot-spot is a gray 50x50 square at opacity 0.1 (ContentView.swift). 0.001 keeps it
+          # hit-testable (the same value the app uses for its other invisible tap area) but you can't see it.
+          perl -0pi -e 's/(\.fill\(Color\.gray\)\s*\.cornerRadius\(25\)\s*)\.opacity\(0\.1\)/${1}.opacity(0.001)/' UltraKiosk/ContentView.swift
+          grep -n 'opacity(0.001)' UltraKiosk/ContentView.swift | head -3
       - name: Build for device (no signing)
         run: |
           xcodebuild build \
@@ -43,7 +49,7 @@ jobs:
           mkdir -p Payload && cp -R "$APP" Payload/
           zip -qr UltraKiosk-unsigned.ipa Payload
           ls -la UltraKiosk-unsigned.ipa
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: UltraKiosk-unsigned-ipa
           path: UltraKiosk-unsigned.ipa
