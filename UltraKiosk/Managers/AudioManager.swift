@@ -52,8 +52,47 @@ class AudioManager: NSObject, ObservableObject {
 
     private lazy var pipeline = AssistPipelineClient(manager: self)
 
+    private var lastAudioAt = Date()
+    private var watchdog: Timer?
+
     override init() {
         super.init()
+        let nc = NotificationCenter.default
+        // The mic stops when iOS interrupts or reconfigures audio (camera, Siri, calls, route changes): restart it.
+        nc.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] n in
+            guard let self = self,
+                  let raw = n.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                  AVAudioSession.InterruptionType(rawValue: raw) == .ended else { return }
+            AppLogger.audio.info("Audio interruption ended - restarting mic")
+            self.restartMic()
+        }
+        nc.addObserver(forName: .AVAudioEngineConfigurationChange, object: nil, queue: .main) { [weak self] _ in
+            AppLogger.audio.info("Audio engine configuration changed - restarting mic")
+            self?.restartMic()
+        }
+        nc.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.setupAudioSession()
+            self?.restartMic()
+        }
+        // Safety net: if no mic audio for 5 s while we should be listening (and nothing is playing), restart it.
+        watchdog = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            guard let self = self, self.isRecording, !self.isSpeaking,
+                  Date().timeIntervalSince(self.lastAudioAt) > 5 else { return }
+            AppLogger.audio.warning("No mic audio for 5 s - restarting mic")
+            self.restartMic()
+        }
+    }
+
+    private var lastRestart = Date.distantPast
+
+    private func restartMic() {
+        // Debounced: restarting the engine can itself post a configuration-change notification.
+        guard settings.enableVoiceActivation, player == nil,
+              Date().timeIntervalSince(lastRestart) > 3 else { return }
+        lastRestart = Date()
+        stopRecording()
+        setupAudioSession()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { self.startRecording() }
     }
 
     // MARK: - Short cues ("listening" / "done") - played WITHOUT restarting the mic
@@ -144,6 +183,7 @@ class AudioManager: NSObject, ObservableObject {
 
     private func processAudioBuffer(_ buffer: AVAudioPCMBuffer) {
         guard let channel = buffer.floatChannelData?[0] else { return }
+        lastAudioAt = Date()
         let n = Int(buffer.frameLength)
         if n == 0 { return }
         let samples = convertFloatToInt16(floatSamples: Array(UnsafeBufferPointer(start: channel, count: n)))
@@ -398,7 +438,7 @@ final class AssistPipelineClient: NSObject {
         runActive = true
         send(["id": runId, "type": "assist_pipeline/run",
               "start_stage": "wake_word", "end_stage": "tts", "pipeline": pid,
-              "input": ["sample_rate": 16000, "timeout": 3],
+              "input": ["sample_rate": 16000, "timeout": 3600],   // seconds of SILENCE before giving up (HA default 3)
               "timeout": 3600])
     }
 

@@ -83,6 +83,9 @@ class FaceDetectionManager: NSObject, ObservableObject {
     private func configureCaptureSession() {
         captureSession = AVCaptureSession()
         captureSession?.sessionPreset = .low
+        // JP fork 11-07: camera only - never let the capture session reconfigure the shared audio session
+        // (by default it does, which silently killed the voice mic whenever the screensaver started face detection).
+        captureSession?.automaticallyConfiguresApplicationAudioSession = false
         
         guard let frontCamera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front),
               let input = try? AVCaptureDeviceInput(device: frontCamera),
