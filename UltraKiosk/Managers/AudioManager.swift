@@ -1,7 +1,18 @@
 import AVFoundation
 import Combine
-import Speech
-import Porcupine
+
+// ============================================================================================================
+// JP's fork (2026-11-07): voice now runs through Home Assistant's own Assist pipeline, like the Echo does.
+//
+//   iPad mic (16 kHz mono) --websocket--> HA assist_pipeline/run, start_stage "wake_word"
+//        -> wake word "Eden" detected on the SERVER (wyoming-microwakeword, same model as the Echo)
+//        -> Whisper STT -> Eden (conversation agent) -> Piper "Alba" voice -> this app plays the reply MP3.
+//
+// Replaces upstream's Porcupine wake word (paid only since June 2026) + Apple speech recognition (hard-coded
+// German) + Apple TTS. No new settings screen: the "Conversation Agent" setting picks the pipeline by NAME or ID
+// (e.g. "Riverview (iPad)"); if it matches nothing, the first pipeline that has a wake word is used.
+// The mic is paused while a reply plays, so Eden can't wake herself.
+// ============================================================================================================
 
 enum APIError: Error, LocalizedError {
     case invalidURL
@@ -10,540 +21,418 @@ enum APIError: Error, LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .invalidURL:
-            return "Invalid URL"
-        case .httpError(let code):
-            return "HTTP Error: \(code)"
-        case .invalidResponse:
-            return "Invalid response format"
+        case .invalidURL: return "Invalid URL"
+        case .httpError(let code): return "HTTP Error: \(code)"
+        case .invalidResponse: return "Invalid response format"
         }
     }
 }
 
 extension APIError: Equatable {}
 
-/// Closure type used to perform a URL data load.
-/// Defaults to URLSession.shared; swap in a mock closure during unit tests.
+/// Closure type used to perform a URL data load (kept for upstream's unit tests).
 typealias URLDataLoader = (URLRequest) async throws -> (Data, URLResponse)
 
 class AudioManager: NSObject, ObservableObject {
-    
+
     private let settings = SettingsManager.shared
-    
+
     @Published var isRecording = false
     @Published var homeAssistantConnected = false
     @Published var isSpeaking = false
-    
-    // Configure preferred recording format
-    private var preferredNumChannels: Int = 1 // 1 = mono, 2 = stereo
-    
+
+    private var preferredNumChannels: Int = 1
+
     private var audioEngine: AVAudioEngine?
     private var inputNode: AVAudioInputNode?
-    private var player: AVPlayer?
     private var mixerNode: AVAudioMixerNode?
+    private var player: AVPlayer?
     private var playbackObserver: NSObjectProtocol?
-    private var porcupine: Porcupine?
-    private var audioBuffer: [Int16] = []
+    private var cuePlayer: AVAudioPlayer?
 
-    private var silenceTimer: Timer?
-    private var lastRecognizedText: String = ""
-    private let speechRecognizer = SFSpeechRecognizer(locale: Locale(languageCode: "de"))
-    private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
-    private var recognitionTask: SFSpeechRecognitionTask?
-    
-    private let synthesizer = AVSpeechSynthesizer()
-    private var currentUtterance: AVSpeechUtterance?
+    private lazy var pipeline = AssistPipelineClient(manager: self)
 
     override init() {
         super.init()
-        
-        // Set synthesizer delegate
-        synthesizer.delegate = self
+    }
 
-        SFSpeechRecognizer.requestAuthorization { authStatus in
-            if authStatus == .authorized {
-                AppLogger.speech.info("Speech recognition authorized by user")
-            } else {
-                AppLogger.speech.warning("Speech recognition permission declined by user")
-            }
+    // MARK: - Short cues ("listening" / "done") - played WITHOUT restarting the mic
+
+    func playCue(_ name: String) {
+        guard let url = Bundle.main.url(forResource: name, withExtension: "wav") else { return }
+        do {
+            cuePlayer = try AVAudioPlayer(contentsOf: url)
+            cuePlayer?.play()
+        } catch {
+            AppLogger.audio.error("Cue \(name) failed: \(String(describing: error))")
         }
     }
-    
-    // Plays a short feedback sound. Preferred: bundled asset (e.g. "bing.caf").
+
+    // Upstream API, kept for compatibility (restarts recording after the sound, like before).
     func playFeedbackSound(assetName: String = "bing", assetExtension: String = "caf") {
-        do {
-            let session = AVAudioSession.sharedInstance()
-            try session.setActive(true)
-            try session.overrideOutputAudioPort(.speaker)
-        } catch {
-            AppLogger.audio.error("Audio session activation/override failed for feedback: \(String(describing: error))")
-        }
-        
         if let url = Bundle.main.url(forResource: assetName, withExtension: assetExtension) {
-            let item = AVPlayerItem(url: url)
-            player = AVPlayer(playerItem: item)
-            
-            // Add observer for playback completion
-            playbackObserver = NotificationCenter.default.addObserver(
-                forName: .AVPlayerItemDidPlayToEndTime,
-                object: item,
-                queue: .main
-            ) { [weak self] _ in
-                self?.handlePlaybackCompleted()
-            }
-
-            player?.play()
-            return
+            playURL(url)
         }
     }
 
-    private func handlePlaybackCompleted() {
-        // Remove the observer
-        if let observer = playbackObserver {
-            NotificationCenter.default.removeObserver(observer)
-            playbackObserver = nil
-        }
-        
-        player = nil
-        
-        // Restore audio session for recording
-        do {
-            let session = AVAudioSession.sharedInstance()
-            // Remove the speaker override to restore normal routing
-            try session.overrideOutputAudioPort(.none)
-            // Reconfigure the session for recording
-            setupAudioSession()
-        } catch {
-            AppLogger.audio.error("Failed to restore audio session after playback: \(String(describing: error))")
-        }
-        
-        // Resume recording if it was active before playback
-        if isRecording {
-            stopRecording()
-            
-            // Give a small delay to ensure cleanup is complete
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                self.startRecording()
-            }
-        }
-    }
-    
+    // MARK: - Audio session + engine
+
     func setupAudioSession() {
         do {
             let audioSession = AVAudioSession.sharedInstance()
-            try audioSession.setCategory(.playAndRecord,
-                                         mode: .default,
+            try audioSession.setCategory(.playAndRecord, mode: .default,
                                          options: [.defaultToSpeaker, .allowBluetoothA2DP])
-            
-            // Apply preferred format settings
             try audioSession.setPreferredSampleRate(Double(settings.voiceSampleRate))
             if audioSession.isInputAvailable {
                 try? audioSession.setPreferredInputNumberOfChannels(preferredNumChannels)
             }
-            
             try audioSession.setActive(true)
         } catch {
             AppLogger.audio.error("Audio session setup failed: \(String(describing: error))")
         }
     }
-    
+
     func startRecording() {
         audioEngine = AVAudioEngine()
         inputNode = audioEngine?.inputNode
-        
-        guard let audioEngine = audioEngine, let inputNode = inputNode else {
-            return
-        }
-        
-        // Desired recording format that downstream consumers expect
+        guard let audioEngine = audioEngine, let inputNode = inputNode else { return }
+
+        // 16 kHz mono float from the tap; converted to 16-bit PCM for Home Assistant.
         let desiredFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
-                                          sampleRate: Double(settings.voiceSampleRate),
+                                          sampleRate: 16000,
                                           channels: AVAudioChannelCount(preferredNumChannels),
                                           interleaved: false)
-        
-        // Build graph: input -> mixer -> mainMixer
+
         let mixer = AVAudioMixerNode()
         mixerNode = mixer
         audioEngine.attach(mixer)
-        
         let hardwareFormat = inputNode.outputFormat(forBus: 0)
         audioEngine.connect(inputNode, to: mixer, format: hardwareFormat)
         audioEngine.connect(mixer, to: audioEngine.mainMixerNode, format: desiredFormat)
+        audioEngine.mainMixerNode.outputVolume = 0          // never play the mic through the speaker
 
-        // Prevent microphone monitoring through speakers while still allowing taps to receive data
-        audioEngine.mainMixerNode.outputVolume = 0
-        
-        // Init porcupine
-        do {
-            porcupine = try Porcupine(
-                accessKey: settings.porcupineAccessToken,
-                keywords: [Porcupine.BuiltInKeyword.alexa],
-            )
-        } catch {
-            AppLogger.audio.error("Failed to initialize Porcupine: \(String(describing: error))")
-        }
-        
-        // Install tap on mixer so we receive buffers in the desired format (engine converts)
-        mixer.installTap(onBus: 0, bufferSize: 512, format: desiredFormat) { [weak self] buffer, _ in
+        mixer.installTap(onBus: 0, bufferSize: 1024, format: desiredFormat) { [weak self] buffer, _ in
             self?.processAudioBuffer(buffer)
         }
-        
+
         do {
             try audioEngine.start()
-            DispatchQueue.main.async {
-                self.isRecording = true
-            }
+            DispatchQueue.main.async { self.isRecording = true }
+            pipeline.start()                                  // no-op if already connected
         } catch {
             AppLogger.audio.error("Failed to start audio engine: \(String(describing: error))")
         }
     }
-    
+
     func stopRecording() {
         audioEngine?.stop()
-
         mixerNode?.removeTap(onBus: 0)
         mixerNode = nil
         inputNode = nil
         audioEngine = nil
-        
-        porcupine?.delete()
-        porcupine = nil;
-        
-        DispatchQueue.main.async {
-            self.isRecording = false
-        }
+        DispatchQueue.main.async { self.isRecording = false }
     }
-    
+
     func convertFloatToInt16(floatSamples: [Float]) -> [Int16] {
-        var int16Samples = [Int16](repeating: 0, count: floatSamples.count)
-
+        var out = [Int16](repeating: 0, count: floatSamples.count)
         for i in 0..<floatSamples.count {
-            // Clamp float value to [-1.0, 1.0] range
-            let clampedValue = max(-1.0, min(1.0, floatSamples[i]))
-
-            // Convert to Int16 range
-            let scaledValue = clampedValue * Float(Int16.max)
-            int16Samples[i] = Int16(scaledValue)
+            let v = max(-1.0, min(1.0, floatSamples[i]))
+            out[i] = Int16(v * Float(Int16.max))
         }
-
-        return int16Samples
+        return out
     }
-    
-    func getBestVoce(prefix: String, language: String) -> AVSpeechSynthesisVoice? {
-        let voices = AVSpeechSynthesisVoice.speechVoices()
-        let allVoices = voices.filter { $0.language.hasPrefix("de") }
-        
-        #if DEBUG
-        AppLogger.speech.debug("=== Available German voices ===")
-        for voice in allVoices {
-            AppLogger.speech.debug("Name: \(voice.name), Language: \(voice.language), Quality: \(voice.quality.rawValue), ID: \(voice.identifier)")
-        }
-        #endif
-        
-        // Strategie: Beste verfügbare Stimme wählen
-        if #available(iOS 16, *) {
-            // 1. Versuch: Premium Stimme (beste Qualität)
-            if let premium = allVoices.first(where: {
-                $0.quality == .premium && $0.language == language
-            }) {
-                AppLogger.speech.info("Using Premium voice: \(premium.name)")
-                return premium
-            }
-            
-            // 2. Versuch: Enhanced Stimme
-            if let enhanced = allVoices.first(where: {
-                $0.quality == .enhanced && $0.language == language
-            }) {
-                AppLogger.speech.info("Using Enhanced voice: \(enhanced.name)")
-                return enhanced
-            }
-        }
-        
-        // 3. Fallback: Beste verfügbare Default-Stimme
-        let defaultVoice = AVSpeechSynthesisVoice(language: language)
-        AppLogger.speech.info("Using Default voice: \(defaultVoice?.name ?? "unknown")")
-        return defaultVoice
-    }
-    
-    private func speak(text: String, language: String) {
-        DispatchQueue.main.async { [weak self] in
-            self?.isSpeaking = true
-        }
-        
-        let utterance = AVSpeechUtterance(string: text)
-        utterance.voice = getBestVoce(prefix: "de", language: "de-DE")
-               
-        // Sprechgeschwindigkeit (0.0 - 1.0, default: 0.5)
-        utterance.rate = 0.5
 
-        // Tonhöhe (0.5 - 2.0, default: 1.0)
-        utterance.pitchMultiplier = 1.0
-
-        // Lautstärke (0.0 - 1.0, default: 1.0)
-        utterance.volume = 1.0
-
-        // Pre/Post-Pausen
-        utterance.preUtteranceDelay = 0.0
-        utterance.postUtteranceDelay = 0.0
-
-        currentUtterance = utterance
-        synthesizer.speak(utterance)
-    }
-    
-    private func resetSilenceTimer() {
-        silenceTimer?.invalidate()
-        
-        silenceTimer = Timer.scheduledTimer(withTimeInterval: TimeInterval(settings.voiceTimeout), repeats: false) { [weak self] _ in
-            self?.recognitionRequest?.endAudio()
-            self?.recognitionRequest = nil
-            self?.recognitionTask?.cancel()
-            self?.recognitionTask = nil
-            self?.silenceTimer?.invalidate()
-            self?.silenceTimer = nil
-            
-            AppLogger.speech.info("Voice session ended due to inactivity. Last text: \(self?.lastRecognizedText ?? "<none>")")
-            
-            self?.playFeedbackSound(assetName: "Speech_Off", assetExtension: "wav")
-            
-            Task {
-                do {
-                    let response = try await self?.sendHomeAssistantConversation(
-                        text: "\(self?.lastRecognizedText ?? "<unknown>")",
-                        language: "de"
-                    )
-
-                    AppLogger.homeAssistant.info("Received conversation response")
-                    
-                    self?.speak(text: response ?? "Es ist ein Fehler passiert!", language: "de-DE")
-                   
-                } catch {
-                    AppLogger.homeAssistant.error("Home Assistant conversation error: \(error.localizedDescription)")
-
-                    self?.speak(text: "Es trat ein technischer Fehler auf. Bitte versuchen Sie es erneut!", language: "de-DE")
-                }
-            }
-        }
-    }
-    
-    func sendHomeAssistantConversation(
-        text: String,
-        language: String,
-        urlLoader: URLDataLoader = { try await URLSession.shared.data(for: $0) }
-    ) async throws -> String {
-        // Construct the URL
-        guard let url = URL(string: "\(settings.homeAssistantBaseURL)/api/conversation/process") else {
-            throw APIError.invalidURL
-        }
-        
-        // Create the request
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(settings.accessToken)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 30
-        
-        // Create the request body
-        let body: [String: Any] = [
-            "text": text,
-            "language": language,
-            "agent_id": settings.homeAssistantConversationAgent,
-            "conversation_id": settings.homeAssistantConversationId
-        ]
-        
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        
-        // Log the request
-        AppLogger.homeAssistant.debug("=== HomeAssistant API Request ===")
-        AppLogger.homeAssistant.debug("URL: \(url.absoluteString)")
-        AppLogger.homeAssistant.debug("Method: \(request.httpMethod ?? "N/A")")
-        AppLogger.homeAssistant.debug("Headers: \(String(describing: request.allHTTPHeaderFields))")
-        if let bodyData = request.httpBody,
-           let bodyString = String(data: bodyData, encoding: .utf8) {
-            AppLogger.homeAssistant.debug("Body: \(bodyString)")
-        }
-        
-        // Perform the request
-        let (data, response) = try await urlLoader(request)
-        
-        // Log the response
-        AppLogger.homeAssistant.debug("=== HomeAssistant API Response ===")
-        if let httpResponse = response as? HTTPURLResponse {
-            AppLogger.homeAssistant.debug("Status Code: \(httpResponse.statusCode)")
-            AppLogger.homeAssistant.debug("Headers: \(String(describing: httpResponse.allHeaderFields))")
-        }
-        if let responseString = String(data: data, encoding: .utf8) {
-            AppLogger.homeAssistant.debug("Body: \(responseString)")
-        }
-        
-        // Check for HTTP errors
-        guard let httpResponse = response as? HTTPURLResponse,
-              (200...299).contains(httpResponse.statusCode) else {
-            throw APIError.httpError((response as? HTTPURLResponse)?.statusCode ?? 0)
-        }
-        
-        // Parse the JSON response
-        guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let responseData = json["response"] as? [String: Any],
-              let speech = responseData["speech"] as? [String: Any],
-              let plainText = speech["plain"] as? [String: Any],
-              let speechText = plainText["speech"] as? String else {
-            throw APIError.invalidResponse
-        }
-        
-        return speechText
-    }
-    
     private func processAudioBuffer(_ buffer: AVAudioPCMBuffer) {
-        
-        if let request = recognitionRequest {
-            request.append(buffer)
-            return
-        }
-        
-        guard let porcupine = porcupine,
-          let floatChannelData = buffer.floatChannelData else {
-            return
-        }
-                
-        let frameLength = Int(buffer.frameLength)
-        let channelData = floatChannelData[0] // Use first channel (mono)
-                
-        // Convert float samples (-1.0 to 1.0) to Int16 (-32768 to 32767)
-        let samplesArray = Array(UnsafeBufferPointer(start: channelData, count: frameLength))
-        let int16Samples = convertFloatToInt16(floatSamples: samplesArray)
-                
-        // Add samples to our buffer
-        audioBuffer.append(contentsOf: int16Samples)
-                
-        // Process in chunks of Porcupine frame length
-        let frameSize = Int(Porcupine.frameLength)
-                
-        while audioBuffer.count >= frameSize {
-            // Extract one frame worth of samples
-            let frame = Array(audioBuffer.prefix(frameSize))
-            audioBuffer.removeFirst(frameSize)
-                    
-            // Process the frame with Porcupine
-            do {
-                let keywordIndex = try porcupine.process(pcm: frame)
-                if keywordIndex >= 0 {
-                    AppLogger.speech.info("Wake word detected! Keyword index: \(keywordIndex)")
-                    
-                    playFeedbackSound(assetName: "Speech_On", assetExtension: "wav")
-                    
-                    // Recognition Task starten
-                    recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
-                    guard let recognitionRequest = recognitionRequest else {
-                        throw NSError(domain: "SpeechRecognizer", code: -1,
-                                     userInfo: [NSLocalizedDescriptionKey: "Unable to create recognition request"])
-                    }
-                    
-                    // Ergebnisse während der Aufnahme liefern
-                    recognitionRequest.shouldReportPartialResults = true
-                    recognitionRequest.requiresOnDeviceRecognition = true
-                    
-                    lastRecognizedText = ""
-
-                    recognitionTask = speechRecognizer?.recognitionTask(with: recognitionRequest) { [weak self] result, error in
-                        var isFinal = false
-                        
-                        if let result = result {
-                            let recognizedText = result.bestTranscription.formattedString
-                            AppLogger.speech.debug("Recognized text: \(recognizedText)")
-                            
-                            self?.lastRecognizedText = recognizedText
-                            self?.resetSilenceTimer()
-                            
-                            isFinal = result.isFinal
-                        }
-                        
-                        if error != nil || isFinal {
-                            self?.recognitionRequest?.endAudio()
-                            self?.recognitionRequest = nil
-                            self?.recognitionTask = nil
-                            self?.silenceTimer?.invalidate()
-                            self?.silenceTimer = nil
-                            
-                            if let error = error {
-                                AppLogger.speech.error("Speech recognition error: \(error.localizedDescription)")
-                            }
-                        }
-                    }
-                    
-                    AppLogger.speech.info("Speech recognition task started")
-                    return
-                }
-            } catch {
-                AppLogger.audio.error("Porcupine processing error: \(error.localizedDescription)")
-            }
-        }
+        guard let channel = buffer.floatChannelData?[0] else { return }
+        let n = Int(buffer.frameLength)
+        if n == 0 { return }
+        let samples = convertFloatToInt16(floatSamples: Array(UnsafeBufferPointer(start: channel, count: n)))
+        let data = samples.withUnsafeBufferPointer { Data(buffer: $0) }   // little-endian on iOS
+        pipeline.sendAudio(data)
     }
-    
-    // Plays an MP3 from a remote or local URL using AVPlayer
+
+    // MARK: - Reply playback (Eden's voice from Home Assistant)
+
     func playMP3(from url: URL) {
+        playURL(url)
+    }
+
+    private func playURL(_ url: URL) {
         do {
-            // Keep current category (.playAndRecord) but ensure session is active and speaker is used
             let session = AVAudioSession.sharedInstance()
             try session.setActive(true)
             try session.overrideOutputAudioPort(.speaker)
         } catch {
             AppLogger.audio.error("Audio session activation/override failed: \(String(describing: error))")
         }
-        
+        DispatchQueue.main.async { self.isSpeaking = true }
         let item = AVPlayerItem(url: url)
         player = AVPlayer(playerItem: item)
-        
-        // Add observer for playback completion
         playbackObserver = NotificationCenter.default.addObserver(
-            forName: .AVPlayerItemDidPlayToEndTime,
-            object: item,
-            queue: .main
+            forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main
         ) { [weak self] _ in
             self?.handlePlaybackCompleted()
         }
-
+        // If the reply can't be played (bad URL, network), don't leave the mic paused forever.
+        NotificationCenter.default.addObserver(forName: .AVPlayerItemFailedToPlayToEndTime, object: item, queue: .main) { [weak self] _ in
+            AppLogger.audio.error("Reply playback failed")
+            self?.handlePlaybackCompleted()
+        }
         player?.play()
     }
-}
-// MARK: - AVSpeechSynthesizerDelegate
-extension AudioManager: AVSpeechSynthesizerDelegate {
-    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
-        AppLogger.speech.info("Speech synthesis started")
-    }
-    
-    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
-        AppLogger.speech.info("Speech synthesis finished")
-        
-        DispatchQueue.main.async { [weak self] in
-            self?.isSpeaking = false
+
+    private func handlePlaybackCompleted() {
+        if let observer = playbackObserver {
+            NotificationCenter.default.removeObserver(observer)
+            playbackObserver = nil
         }
-        
-        // Resume recording after speech finishes if voice activation is enabled
-        if settings.enableVoiceActivation && !isRecording {
-            AppLogger.speech.info("Resuming recording after speech")
-            startRecording()
+        player = nil
+        DispatchQueue.main.async { self.isSpeaking = false }
+        do {
+            try AVAudioSession.sharedInstance().overrideOutputAudioPort(.none)
+            setupAudioSession()
+        } catch {
+            AppLogger.audio.error("Failed to restore audio session after playback: \(String(describing: error))")
         }
-    }
-    
-    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
-        AppLogger.speech.warning("Speech synthesis cancelled")
-        
-        DispatchQueue.main.async { [weak self] in
-            self?.isSpeaking = false
+        if isRecording {                                      // the speaker override can break the input: restart it
+            stopRecording()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { self.startRecording() }
         }
-        
-        // Resume recording if voice activation is enabled
-        if settings.enableVoiceActivation && !isRecording {
-            startRecording()
+        pipeline.replyFinished()                              // listen for the wake word again
+    }
+
+    // MARK: - Upstream text API (unused by the voice path now; kept so upstream's tests still compile)
+
+    func sendHomeAssistantConversation(
+        text: String,
+        language: String,
+        urlLoader: URLDataLoader = { try await URLSession.shared.data(for: $0) }
+    ) async throws -> String {
+        guard let url = URL(string: "\(settings.homeAssistantBaseURL)/api/conversation/process") else {
+            throw APIError.invalidURL
         }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(settings.accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 30
+        let body: [String: Any] = ["text": text, "language": language,
+                                   "agent_id": settings.homeAssistantConversationAgent,
+                                   "conversation_id": settings.homeAssistantConversationId]
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, response) = try await urlLoader(request)
+        guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+            throw APIError.httpError((response as? HTTPURLResponse)?.statusCode ?? 0)
+        }
+        guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let r = json["response"] as? [String: Any], let speech = r["speech"] as? [String: Any],
+              let plain = speech["plain"] as? [String: Any], let text = plain["speech"] as? String else {
+            throw APIError.invalidResponse
+        }
+        return text
     }
-    
-    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didPause utterance: AVSpeechUtterance) {
-        AppLogger.speech.debug("Speech synthesis paused")
-    }
-    
-    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didContinue utterance: AVSpeechUtterance) {
-        AppLogger.speech.debug("Speech synthesis continued")
+
+    fileprivate func setConnected(_ value: Bool) {
+        DispatchQueue.main.async { self.homeAssistantConnected = value }
     }
 }
 
+// ============================================================================================================
+// Home Assistant websocket client for one continuous voice satellite.
+// One pipeline run at a time: wake_word -> stt -> intent -> tts. When a run ends we start the next one; while
+// Eden's reply is playing we send no audio (paused) and start the next run only after playback finishes.
+// ============================================================================================================
+final class AssistPipelineClient: NSObject {
+    private weak var manager: AudioManager?
+    private let settings = SettingsManager.shared
+    private let queue = DispatchQueue(label: "ultrakiosk.assist")
+
+    private var socket: URLSessionWebSocketTask?
+    private var session: URLSession?
+    private var started = false
+    private var authed = false
+    private var nextId = 1
+    private var listId = -1
+    private var runId = -1
+    private var pipelineId: String?
+    private var handlerId: UInt8?
+    private var runActive = false
+    private var waitingForReply = false          // TTS url received, reply playing: no audio, no new run
+
+    init(manager: AudioManager) {
+        self.manager = manager
+        super.init()
+    }
+
+    func start() {
+        queue.async {
+            if self.started { return }
+            self.started = true
+            self.connect()
+        }
+    }
+
+    func sendAudio(_ pcm: Data) {
+        queue.async {
+            guard self.runActive, !self.waitingForReply, let h = self.handlerId, let s = self.socket else { return }
+            var msg = Data([h])
+            msg.append(pcm)
+            s.send(.data(msg)) { _ in }
+        }
+    }
+
+    func replyFinished() {
+        queue.async {
+            self.waitingForReply = false
+            if !self.runActive { self.queue.asyncAfter(deadline: .now() + 0.4) { self.startRun() } }
+        }
+    }
+
+    // MARK: connection
+
+    private func baseURL() -> String { settings.homeAssistantBaseURL }
+
+    private func connect() {
+        let ws = baseURL().replacingOccurrences(of: "https://", with: "wss://")
+                          .replacingOccurrences(of: "http://", with: "ws://") + "/api/websocket"
+        guard let url = URL(string: ws) else {
+            AppLogger.homeAssistant.error("Bad Home Assistant URL for websocket: \(ws)")
+            return
+        }
+        authed = false; runActive = false; handlerId = nil; pipelineId = nil
+        session = URLSession(configuration: .default)
+        socket = session?.webSocketTask(with: url)
+        socket?.maximumMessageSize = 4 * 1024 * 1024
+        socket?.resume()
+        AppLogger.homeAssistant.info("Assist: connecting to \(ws)")
+        receive()
+    }
+
+    private func reconnect(after seconds: Double) {
+        socket?.cancel(with: .goingAway, reason: nil)
+        socket = nil
+        manager?.setConnected(false)
+        queue.asyncAfter(deadline: .now() + seconds) { self.connect() }
+    }
+
+    private func send(_ obj: [String: Any]) {
+        guard let data = try? JSONSerialization.data(withJSONObject: obj),
+              let text = String(data: data, encoding: .utf8) else { return }
+        socket?.send(.string(text)) { error in
+            if let error = error { AppLogger.homeAssistant.error("Assist send failed: \(error.localizedDescription)") }
+        }
+    }
+
+    private func receive() {
+        socket?.receive { [weak self] result in
+            guard let self = self else { return }
+            self.queue.async {
+                switch result {
+                case .failure(let error):
+                    AppLogger.homeAssistant.error("Assist websocket closed: \(error.localizedDescription)")
+                    self.reconnect(after: 5)
+                case .success(let message):
+                    if case .string(let text) = message,
+                       let data = text.data(using: .utf8),
+                       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                        self.handle(json)
+                    }
+                    self.receive()
+                }
+            }
+        }
+    }
+
+    // MARK: protocol
+
+    private func handle(_ m: [String: Any]) {
+        let type = m["type"] as? String ?? ""
+        switch type {
+        case "auth_required":
+            send(["type": "auth", "access_token": settings.accessToken])
+        case "auth_ok":
+            authed = true
+            manager?.setConnected(true)
+            listId = nextId; nextId += 1
+            send(["id": listId, "type": "assist_pipeline/pipeline/list"])
+        case "auth_invalid":
+            AppLogger.homeAssistant.error("Assist: access token rejected - check the token in settings")
+            reconnect(after: 60)
+        case "result":
+            let id = m["id"] as? Int ?? -1
+            let ok = m["success"] as? Bool ?? false
+            if id == listId {
+                choosePipeline(m["result"] as? [String: Any])
+                startRun()
+            } else if id == runId && !ok {
+                let err = (m["error"] as? [String: Any])?["message"] as? String ?? "?"
+                AppLogger.homeAssistant.error("Assist: run refused: \(err)")
+                runActive = false
+                queue.asyncAfter(deadline: .now() + 10) { self.startRun() }
+            }
+        case "event":
+            guard (m["id"] as? Int) == runId, let ev = m["event"] as? [String: Any] else { return }
+            handleEvent(ev["type"] as? String ?? "", ev["data"] as? [String: Any] ?? [:])
+        default:
+            break
+        }
+    }
+
+    private func choosePipeline(_ result: [String: Any]?) {
+        let list = result?["pipelines"] as? [[String: Any]] ?? []
+        let wanted = settings.homeAssistantConversationAgent.trimmingCharacters(in: .whitespaces)
+        if let p = list.first(where: { ($0["name"] as? String) == wanted || ($0["id"] as? String) == wanted }) {
+            pipelineId = p["id"] as? String
+        } else if let p = list.first(where: { !(($0["wake_word_entity"] as? String) ?? "").isEmpty }) {
+            pipelineId = p["id"] as? String
+        } else {
+            pipelineId = nil
+        }
+        AppLogger.homeAssistant.info("Assist: using pipeline \(self.pipelineId ?? "<none - add a wake word to a pipeline>")")
+    }
+
+    private func startRun() {
+        guard authed, !runActive, !waitingForReply, let pid = pipelineId else { return }
+        runId = nextId; nextId += 1
+        handlerId = nil
+        runActive = true
+        send(["id": runId, "type": "assist_pipeline/run",
+              "start_stage": "wake_word", "end_stage": "tts", "pipeline": pid,
+              "input": ["sample_rate": 16000, "timeout": 3],
+              "timeout": 3600])
+    }
+
+    private func handleEvent(_ type: String, _ d: [String: Any]) {
+        switch type {
+        case "run-start":
+            if let rd = d["runner_data"] as? [String: Any], let h = rd["stt_binary_handler_id"] as? Int {
+                handlerId = UInt8(truncatingIfNeeded: h)
+            }
+        case "wake_word-end":
+            if let out = d["wake_word_output"] as? [String: Any], !out.isEmpty {
+                AppLogger.speech.info("Assist: wake word \(String(describing: out["wake_word_id"]))")
+                DispatchQueue.main.async { self.manager?.playCue("Speech_On") }
+            }
+        case "stt-end":
+            let text = (d["stt_output"] as? [String: Any])?["text"] as? String ?? ""
+            AppLogger.speech.info("Assist: heard '\(text)'")
+            DispatchQueue.main.async { self.manager?.playCue("Speech_Off") }
+        case "tts-end":
+            if let out = d["tts_output"] as? [String: Any], let u = out["url"] as? String {
+                let full = u.hasPrefix("http") ? u : baseURL() + u
+                if let url = URL(string: full) {
+                    waitingForReply = true
+                    DispatchQueue.main.async { self.manager?.playMP3(from: url) }
+                }
+            }
+        case "error":
+            AppLogger.homeAssistant.warning("Assist: \(String(describing: d["code"])) \(String(describing: d["message"]))")
+        case "run-end":
+            runActive = false
+            handlerId = nil
+            if !waitingForReply { queue.asyncAfter(deadline: .now() + 0.3) { self.startRun() } }
+        default:
+            break
+        }
+    }
+}
