@@ -142,6 +142,19 @@ class AudioManager: NSObject, ObservableObject {
                                           channels: AVAudioChannelCount(preferredNumChannels),
                                           interleaved: false)
 
+        // 11-08: Apple's voice processing (the FaceTime/speakerphone chain): automatic gain, noise suppression and echo
+        // cancellation on the mic. The raw iPad mic was too quiet/rough for the "Eden" wake word (<50% caught).
+        do {
+            try inputNode.setVoiceProcessingEnabled(true)
+            if #available(iOS 17.0, *) {
+                // don't turn other audio (Eden's replies) down while the mic is live
+                inputNode.voiceProcessingOtherAudioDuckingConfiguration =
+                    AVAudioVoiceProcessingOtherAudioDuckingConfiguration(enableAdvancedDucking: false, duckingLevel: .min)
+            }
+        } catch {
+            AppLogger.audio.error("Voice processing unavailable: \(String(describing: error))")
+        }
+
         let mixer = AVAudioMixerNode()
         mixerNode = mixer
         audioEngine.attach(mixer)
@@ -298,6 +311,8 @@ final class AssistPipelineClient: NSObject {
     private var handlerId: UInt8?
     private var runActive = false
     private var waitingForReply = false          // TTS url received, reply playing: no audio, no new run
+    private var lastEventAt = Date()
+    private var heartbeat: DispatchSourceTimer?
 
     init(manager: AudioManager) {
         self.manager = manager
@@ -309,7 +324,32 @@ final class AssistPipelineClient: NSObject {
             if self.started { return }
             self.started = true
             self.connect()
+            self.startHeartbeat()
         }
+    }
+
+    // 11-08: the iPad stopped listening overnight with no error. Every 60 s: ping the socket (reconnect if it fails),
+    // and if a run has produced no events for > 65 min (HA's run timeout is 60), start over.
+    private func startHeartbeat() {
+        let t = DispatchSource.makeTimerSource(queue: queue)
+        t.schedule(deadline: .now() + 60, repeating: 60)
+        t.setEventHandler { [weak self] in
+            guard let self = self, let s = self.socket else { return }
+            s.sendPing { error in
+                if let error = error {
+                    self.queue.async {
+                        AppLogger.homeAssistant.warning("Assist: ping failed (\(error.localizedDescription)) - reconnecting")
+                        self.reconnect(after: 1)
+                    }
+                }
+            }
+            if self.runActive && !self.waitingForReply && Date().timeIntervalSince(self.lastEventAt) > 65 * 60 {
+                AppLogger.homeAssistant.warning("Assist: run silent for 65 min - restarting it")
+                self.reconnect(after: 1)
+            }
+        }
+        t.resume()
+        heartbeat = t
     }
 
     func sendAudio(_ pcm: Data) {
@@ -412,6 +452,7 @@ final class AssistPipelineClient: NSObject {
             }
         case "event":
             guard (m["id"] as? Int) == runId, let ev = m["event"] as? [String: Any] else { return }
+            lastEventAt = Date()
             handleEvent(ev["type"] as? String ?? "", ev["data"] as? [String: Any] ?? [:])
         default:
             break
@@ -436,6 +477,7 @@ final class AssistPipelineClient: NSObject {
         runId = nextId; nextId += 1
         handlerId = nil
         runActive = true
+        lastEventAt = Date()
         send(["id": runId, "type": "assist_pipeline/run",
               "start_stage": "wake_word", "end_stage": "tts", "pipeline": pid,
               "input": ["sample_rate": 16000, "timeout": 3600],   // seconds of SILENCE before giving up (HA default 3)
